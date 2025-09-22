@@ -7,6 +7,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 EPOCHS = 5
 
+
 transform = transforms.Compose(
     [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
 )
@@ -37,6 +38,49 @@ class BasicModel(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+class TransformerModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.patch_size = 7
+        self.embed_dim = 64
+
+        self.patch_embedding = nn.Conv2d(
+            1, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+        )
+
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+        self.pos_embedding = nn.Parameter(
+            torch.randn(1, (28 // self.patch_size) ** 2 + 1, self.embed_dim)
+        )
+
+        self.encoder_layers = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=self.embed_dim, nhead=8, dim_feedforward=256
+                )
+                for _ in range(6)
+            ]
+        )
+
+        self.classifier = nn.Linear(self.embed_dim, 10)
+
+    def forward(self, x):
+        x = self.patch_embedding(x)
+        x = x.flatten(2).transpose(1, 2)
+
+        batch_size = x.size(0)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embedding
+
+        for layer in self.encoder_layers:
+            x = layer(x)
+
+        cls_output = x[:, 0]
+        logits = self.classifier(cls_output)
+        return logits
 
 
 def train(model, loader, optimizer, loss_fn):
@@ -71,14 +115,28 @@ def test(model, loader, loss_fn):
     return avg_loss, accuracy
 
 
-model = BasicModel().to(DEVICE)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 loss_fn = nn.CrossEntropyLoss()
 
 
+basic_model = BasicModel().to(DEVICE)
+basic_optimizer = torch.optim.Adam(basic_model.parameters(), lr=0.001)
+
+transformer_model = TransformerModel().to(DEVICE)
+transformer_optimizer = torch.optim.Adam(transformer_model.parameters(), lr=0.001)
+
 for epoch in range(EPOCHS):
-    train_loss = train(model, train_loader, optimizer, loss_fn)
-    test_loss, test_accuracy = test(model, test_loader, loss_fn)
+    basic_train_loss = train(basic_model, train_loader, basic_optimizer, loss_fn)
+    basic_test_loss, basic_test_accuracy = test(basic_model, test_loader, loss_fn)
     print(
-        f"Epoch {epoch + 1}/{EPOCHS}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}"
+        f"Epoch {epoch + 1}/{EPOCHS}, Train Loss: {basic_train_loss:.4f}, Test Loss: {basic_test_loss:.4f}, Test Accuracy: {basic_test_accuracy:.4f}"
+    )
+
+    transformer_train_loss = train(
+        transformer_model, train_loader, transformer_optimizer, loss_fn
+    )
+    transformer_test_loss, transformer_test_accuracy = test(
+        transformer_model, test_loader, loss_fn
+    )
+    print(
+        f"Epoch {epoch + 1}/{EPOCHS}, Train Loss: {transformer_train_loss:.4f}, Test Loss: {transformer_test_loss:.4f}, Test Accuracy: {transformer_test_accuracy:.4f}"
     )
