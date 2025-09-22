@@ -4,7 +4,10 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+EPOCHS = 10
+BATCH_SIZE = 64
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
 
 transform = transforms.Compose(
     [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
@@ -20,8 +23,8 @@ test_dataset = datasets.MNIST(
     root="./data", train=False, download=True, transform=transform
 )
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
 class BasicModel(nn.Module):
@@ -76,7 +79,7 @@ class TransformerModel(nn.Module):
         return self.classifier(x[:, 0])
 
 
-def train(model, loader, optimizer, loss_fn):
+def train(model, loader, optimizer, scheduler, loss_fn):
     model.train()
     total_loss = 0
     for data, target in loader:
@@ -87,6 +90,7 @@ def train(model, loader, optimizer, loss_fn):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+    scheduler.step()
     avg_loss = total_loss / len(loader)
     return avg_loss
 
@@ -108,25 +112,36 @@ def test(model, loader, loss_fn):
     return avg_loss, accuracy
 
 
-print(f"Using device: {DEVICE}\n")
-
-
 loss_fn = nn.CrossEntropyLoss()
 
-
 basic_model = BasicModel().to(DEVICE)
-basic_optimizer = torch.optim.Adam(basic_model.parameters(), lr=0.001)
+basic_optimizer = torch.optim.AdamW(
+    basic_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+)
+basic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    basic_optimizer, T_max=EPOCHS
+)
 
 transformer_model = TransformerModel().to(DEVICE)
 transformer_optimizer = torch.optim.Adam(transformer_model.parameters(), lr=0.001)
+transformer_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    transformer_optimizer, T_max=EPOCHS
+)
 
-EPOCHS = 5
+print(f"Using device: {DEVICE}\n")
+
 for epoch in range(EPOCHS):
-    basic_train_loss = train(basic_model, train_loader, basic_optimizer, loss_fn)
+    basic_train_loss = train(
+        basic_model, train_loader, basic_optimizer, basic_scheduler, loss_fn
+    )
     basic_test_loss, basic_test_accuracy = test(basic_model, test_loader, loss_fn)
 
     transformer_train_loss = train(
-        transformer_model, train_loader, transformer_optimizer, loss_fn
+        transformer_model,
+        train_loader,
+        transformer_optimizer,
+        transformer_scheduler,
+        loss_fn,
     )
     transformer_test_loss, transformer_test_accuracy = test(
         transformer_model, test_loader, loss_fn
