@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+PATCH_SIZE = 14
+EMBED_DIM = 64
 EPOCHS = 10
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
@@ -27,44 +29,34 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
-class BasicModel(nn.Module):
+class Baseline(nn.Module):
+    FEEDFORWARD_DIM = 128
+
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(28 * 28, 128),
-            nn.ReLU(),
-            nn.Linear(128, 10),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class TransformerModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.patch_size = 14
-        self.embed_dim = 64
-        self.feedforward_dim = 128
-
         self.patch_embedding = nn.Conv2d(
-            1, self.embed_dim, kernel_size=self.patch_size, stride=self.patch_size
+            1, EMBED_DIM, kernel_size=PATCH_SIZE, stride=PATCH_SIZE
         )
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.embed_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, EMBED_DIM))
         self.pos_embedding = nn.Parameter(
-            torch.randn(1, (28 // self.patch_size) ** 2 + 1, self.embed_dim)
+            torch.randn(1, (28 // PATCH_SIZE) ** 2 + 1, EMBED_DIM)
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.embed_dim,
-            nhead=1,
-            dim_feedforward=self.feedforward_dim,
-            batch_first=True,
+        self.attention = nn.MultiheadAttention(
+            embed_dim=EMBED_DIM, num_heads=1, batch_first=True
         )
 
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=1)
-        self.classifier = nn.Linear(self.embed_dim, 10)
+        self.norm1 = nn.LayerNorm(EMBED_DIM)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM),
+            nn.ReLU(),
+            nn.Linear(self.FEEDFORWARD_DIM, EMBED_DIM),
+        )
+
+        self.norm2 = nn.LayerNorm(EMBED_DIM)
+
+        self.classifier = nn.Linear(EMBED_DIM, 10)
 
     def forward(self, x):
         x = self.patch_embedding(x).flatten(2).transpose(1, 2)
@@ -74,7 +66,11 @@ class TransformerModel(nn.Module):
 
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embedding
-        x = self.transformer(x)
+
+        attn_output, _ = self.attention(x, x, x)
+        x = self.norm1(x + attn_output)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)
 
         return self.classifier(x[:, 0])
 
@@ -114,41 +110,27 @@ def test(model, loader, loss_fn):
 
 loss_fn = nn.CrossEntropyLoss()
 
-basic_model = BasicModel().to(DEVICE)
-basic_optimizer = torch.optim.AdamW(
-    basic_model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-)
-basic_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    basic_optimizer, T_max=EPOCHS
-)
-
-transformer_model = TransformerModel().to(DEVICE)
-transformer_optimizer = torch.optim.Adam(transformer_model.parameters(), lr=0.001)
-transformer_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    transformer_optimizer, T_max=EPOCHS
+baseline_model = Baseline().to(DEVICE)
+baseline_optimizer = torch.optim.Adam(baseline_model.parameters(), lr=0.001)
+baseline_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    baseline_optimizer, T_max=EPOCHS
 )
 
 print(f"Using device: {DEVICE}\n")
 
 for epoch in range(EPOCHS):
-    basic_train_loss = train(
-        basic_model, train_loader, basic_optimizer, basic_scheduler, loss_fn
-    )
-    basic_test_loss, basic_test_accuracy = test(basic_model, test_loader, loss_fn)
-
-    transformer_train_loss = train(
-        transformer_model,
+    baseline_train_loss = train(
+        baseline_model,
         train_loader,
-        transformer_optimizer,
-        transformer_scheduler,
+        baseline_optimizer,
+        baseline_scheduler,
         loss_fn,
     )
-    transformer_test_loss, transformer_test_accuracy = test(
-        transformer_model, test_loader, loss_fn
+    baseline_test_loss, baseline_test_accuracy = test(
+        baseline_model, test_loader, loss_fn
     )
 
     print(
-        f"Epoch {epoch + 1}/{EPOCHS}\n"
-        f"Basic Model - Train Loss: {basic_train_loss:.4f}, Test Loss: {basic_test_loss:.4f}, Test Accuracy: {basic_test_accuracy:.4f}\n"
-        f"Transformer Model - Train Loss: {transformer_train_loss:.4f}, Test Loss: {transformer_test_loss:.4f}, Test Accuracy: {transformer_test_accuracy:.4f}\n"
+        f"Epoch {epoch + 1}/{EPOCHS}:\n"
+        f"Baseline -- Train Loss: {baseline_train_loss:.4f}, Test Loss: {baseline_test_loss:.4f}, Test Accuracy: {baseline_test_accuracy:.4f}\n"
     )
