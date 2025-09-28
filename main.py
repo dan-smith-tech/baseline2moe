@@ -4,12 +4,15 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
 PATCH_SIZE = 14
 EMBED_DIM = 64
 EPOCHS = 10
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
+NUM_EXPERTS = 4
+SELECT_TOP_K = 2
 
 transform = transforms.Compose(
     [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
@@ -29,10 +32,57 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
-class Baseline(nn.Module):
+class Gate(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(EMBED_DIM, NUM_EXPERTS, bias=False)
+
+    def forward(self, x):
+        logits = self.gate(x)
+
+        topk_logits, topk_indices = torch.topk(logits, SELECT_TOP_K, dim=-1)
+        top_k_probs = torch.softmax(topk_logits, dim=-1)
+
+        weights = torch.zeros_like(logits).to(x.device)
+        weights.scatter(1, topk_indices, top_k_probs)
+
+        return weights, topk_indices
+
+
+class Expert(nn.Module):
     FEEDFORWARD_DIM = 128
 
     def __init__(self):
+        super().__init__()
+        self.ffn = nn.Sequential(
+            nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM),
+            nn.ReLU(),
+            nn.Linear(self.FEEDFORWARD_DIM, EMBED_DIM),
+        )
+
+    def forward(self, x):
+        return self.ffn(x)
+
+
+class MoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.ModuleList([Expert() for _ in range(NUM_EXPERTS)])
+        self.gate = Gate()
+
+    def forward(self, x):
+        x = x.view(-1, x.shape[-1])
+        gate_weights, topk_indices = self.gate(x)
+
+        final_output = torch.zeros(x.shape(0), EMBED_DIM, dtype=x.dtype).to(x.device)
+
+        expert_outputs = []
+
+
+class Baseline(nn.Module):
+    FEEDFORWARD_DIM = 128
+
+    def __init__(self, moe=False):
         super().__init__()
         self.patch_embedding = nn.Conv2d(
             1, EMBED_DIM, kernel_size=PATCH_SIZE, stride=PATCH_SIZE
