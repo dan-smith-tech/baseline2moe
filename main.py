@@ -71,12 +71,38 @@ class MoE(nn.Module):
         self.gate = Gate()
 
     def forward(self, x):
+        original_shape = x.shape
         x = x.view(-1, x.shape[-1])
         gate_weights, topk_indices = self.gate(x)
 
-        final_output = torch.zeros(x.shape(0), EMBED_DIM, dtype=x.dtype).to(x.device)
+        flat_x = x.repeat_interleave(SELECT_TOP_K, dim=0)
+        flat_topk_indices = topk_indices.view(-1)
+
+        final_output = torch.zeros(x.shape[0], EMBED_DIM, dtype=x.dtype).to(x.device)
 
         expert_outputs = []
+        for i in range(len(self.experts)):
+            # positions inside flat_topk_indices where expert i is selected
+            idx = torch.where(flat_topk_indices == i)[0]
+            if idx.numel() > 0:
+                # inputs of every token assigned to expert i
+                expert_input = flat_x[idx]
+                expert_output = self.experts[i](expert_input)
+                expert_outputs.append((idx, expert_output))
+
+        for expert_index, (idx, expert_output) in enumerate(expert_outputs):
+            # corresponding token indices in the original x
+            token_indices = idx // SELECT_TOP_K
+
+            weights = gate_weights[token_indices, expert_index].unsqueeze(-1)
+            weighted_output = expert_output * weights
+
+            final_output.index_add_(0, token_indices, weighted_output)
+
+        final_output = final_output.view(
+            original_shape[0], original_shape[1], EMBED_DIM
+        )
+        return final_output
 
 
 class Baseline(nn.Module):
@@ -98,11 +124,14 @@ class Baseline(nn.Module):
 
         self.norm1 = nn.LayerNorm(EMBED_DIM)
 
-        self.ffn = nn.Sequential(
-            nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM),
-            nn.ReLU(),
-            nn.Linear(self.FEEDFORWARD_DIM, EMBED_DIM),
-        )
+        if moe:
+            self.ffn = MoE()
+        else:
+            self.ffn = nn.Sequential(
+                nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM),
+                nn.ReLU(),
+                nn.Linear(self.FEEDFORWARD_DIM, EMBED_DIM),
+            )
 
         self.norm2 = nn.LayerNorm(EMBED_DIM)
 
@@ -166,6 +195,10 @@ baseline_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     baseline_optimizer, T_max=EPOCHS
 )
 
+moe_model = Baseline(moe=True).to(DEVICE)
+moe_optimizer = torch.optim.Adam(moe_model.parameters(), lr=0.001)
+moe_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(moe_optimizer, T_max=EPOCHS)
+
 print(f"Using device: {DEVICE}\n")
 
 for epoch in range(EPOCHS):
@@ -180,7 +213,13 @@ for epoch in range(EPOCHS):
         baseline_model, test_loader, loss_fn
     )
 
+    moe_train_loss = train(
+        moe_model, train_loader, moe_optimizer, moe_scheduler, loss_fn
+    )
+    moe_test_loss, moe_test_accuracy = test(moe_model, test_loader, loss_fn)
+
     print(
         f"Epoch {epoch + 1}/{EPOCHS}:\n"
         f"Baseline -- Train Loss: {baseline_train_loss:.4f}, Test Loss: {baseline_test_loss:.4f}, Test Accuracy: {baseline_test_accuracy:.4f}\n"
+        f"MoE      -- Train Loss: {moe_train_loss:.4f}, Test Loss: {moe_test_loss:.4f}, Test Accuracy: {moe_test_accuracy:.4f}\n"
     )
