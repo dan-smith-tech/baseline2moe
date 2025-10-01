@@ -102,10 +102,10 @@ class MoE(nn.Module):
         final_output = final_output.view(
             original_shape[0], original_shape[1], EMBED_DIM
         )
-        return final_output
+        return final_output, gate_weights
 
 
-class Baseline(nn.Module):
+class Model(nn.Module):
     FEEDFORWARD_DIM = 128
 
     def __init__(self, moe=False):
@@ -148,10 +148,29 @@ class Baseline(nn.Module):
 
         attn_output, _ = self.attention(x, x, x)
         x = self.norm1(x + attn_output)
-        ffn_output = self.ffn(x)
-        x = self.norm2(x + ffn_output)
 
-        return self.classifier(x[:, 0])
+        if isinstance(self.ffn, MoE):
+            ffn_output, gate_weights = self.ffn(x)
+            x = self.norm2(x + ffn_output)
+            logits = self.classifier(x[:, 0])
+            return logits, gate_weights
+        else:
+            ffn_output = self.ffn(x)
+            x = self.norm2(x + ffn_output)
+            return self.classifier(x[:, 0])
+
+
+def load_balancing_loss(gate_weights, num_experts):
+    num_tokens = gate_weights.shape[0]
+
+    tokens_per_expert = torch.sum(gate_weights, dim=0)
+    f_i = tokens_per_expert / num_tokens
+
+    mean_prob_per_expert = torch.mean(gate_weights, dim=0)
+    P_i = mean_prob_per_expert
+
+    loss = num_experts * torch.sum(f_i * P_i)
+    return loss
 
 
 def train(model, loader, optimizer, scheduler, loss_fn):
@@ -162,6 +181,22 @@ def train(model, loader, optimizer, scheduler, loss_fn):
         optimizer.zero_grad()
         output = model(data)
         loss = loss_fn(output, target)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    scheduler.step()
+    avg_loss = total_loss / len(loader)
+    return avg_loss
+
+
+def train_moe(model, loader, optimizer, scheduler, loss_fn):
+    model.train()
+    total_loss = 0
+    for data, target in loader:
+        data, target = data.to(DEVICE), target.to(DEVICE)
+        optimizer.zero_grad()
+        output, gate_weights = model(data)
+        loss = loss_fn(output, target) + load_balancing_loss(gate_weights, NUM_EXPERTS)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -187,21 +222,40 @@ def test(model, loader, loss_fn):
     return avg_loss, accuracy
 
 
+def test_moe(model, loader, loss_fn):
+    model.eval()
+    total_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(DEVICE), target.to(DEVICE)
+            output, _ = model(data)
+            loss = loss_fn(output, target)
+            total_loss += loss.item()
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    avg_loss = total_loss / len(loader)
+    accuracy = correct / len(loader.dataset)
+    return avg_loss, accuracy
+
+
 loss_fn = nn.CrossEntropyLoss()
 
-baseline_model = Baseline().to(DEVICE)
+baseline_model = Model().to(DEVICE)
 baseline_optimizer = torch.optim.Adam(baseline_model.parameters(), lr=0.001)
 baseline_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
     baseline_optimizer, T_max=EPOCHS
 )
 
-moe_model = Baseline(moe=True).to(DEVICE)
+moe_model = Model(moe=True).to(DEVICE)
 moe_optimizer = torch.optim.Adam(moe_model.parameters(), lr=0.001)
 moe_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(moe_optimizer, T_max=EPOCHS)
 
 print(f"Using device: {DEVICE}\n")
 
 for epoch in range(EPOCHS):
+    print(f"Epoch {epoch + 1}/{EPOCHS}")
+
     baseline_train_loss = train(
         baseline_model,
         train_loader,
@@ -212,14 +266,14 @@ for epoch in range(EPOCHS):
     baseline_test_loss, baseline_test_accuracy = test(
         baseline_model, test_loader, loss_fn
     )
+    print(
+        f"Baseline -- Train Loss: {baseline_train_loss:.4f}, Test Loss: {baseline_test_loss:.4f}, Test Accuracy: {baseline_test_accuracy:.4f}"
+    )
 
-    moe_train_loss = train(
+    moe_train_loss = train_moe(
         moe_model, train_loader, moe_optimizer, moe_scheduler, loss_fn
     )
-    moe_test_loss, moe_test_accuracy = test(moe_model, test_loader, loss_fn)
-
+    moe_test_loss, moe_test_accuracy = test_moe(moe_model, test_loader, loss_fn)
     print(
-        f"Epoch {epoch + 1}/{EPOCHS}:\n"
-        f"Baseline -- Train Loss: {baseline_train_loss:.4f}, Test Loss: {baseline_test_loss:.4f}, Test Accuracy: {baseline_test_accuracy:.4f}\n"
         f"MoE      -- Train Loss: {moe_train_loss:.4f}, Test Loss: {moe_test_loss:.4f}, Test Accuracy: {moe_test_accuracy:.4f}\n"
     )
