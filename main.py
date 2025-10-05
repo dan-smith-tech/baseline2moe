@@ -7,7 +7,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 PATCH_SIZE = 14
 EMBED_DIM = 64
-EPOCHS = 10
+EPOCHS = 100
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -55,9 +55,9 @@ class Expert(nn.Module):
     def __init__(self):
         super().__init__()
         self.ffn = nn.Sequential(
-            nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM),
+            nn.Linear(EMBED_DIM, self.FEEDFORWARD_DIM // NUM_EXPERTS),
             nn.ReLU(),
-            nn.Linear(self.FEEDFORWARD_DIM, EMBED_DIM),
+            nn.Linear(self.FEEDFORWARD_DIM // NUM_EXPERTS, EMBED_DIM),
         )
 
     def forward(self, x):
@@ -196,7 +196,10 @@ def train_moe(model, loader, optimizer, scheduler, loss_fn):
         data, target = data.to(DEVICE), target.to(DEVICE)
         optimizer.zero_grad()
         output, gate_weights = model(data)
-        loss = loss_fn(output, target) + load_balancing_loss(gate_weights, NUM_EXPERTS)
+        loss = (
+            loss_fn(output, target)
+            + load_balancing_loss(gate_weights, NUM_EXPERTS) * 0.05
+        )
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -229,8 +232,11 @@ def test_moe(model, loader, loss_fn):
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(DEVICE), target.to(DEVICE)
-            output, _ = model(data)
-            loss = loss_fn(output, target)
+            output, gate_weights = model(data)
+            loss = (
+                loss_fn(output, target)
+                + load_balancing_loss(gate_weights, NUM_EXPERTS) * 0.05
+            )
             total_loss += loss.item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
