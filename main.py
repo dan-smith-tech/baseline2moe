@@ -449,15 +449,15 @@ for epoch in range(EPOCHS):
     print(f"Expert distribution -- {distribution_str}\n")
     moe_model.ffn.reset_expert_counts()
 
-fig, ax = plt.subplots(figsize=(9, 5))
+fig, ax = plt.subplots(figsize=(8, 3))
 history = list(zip(*expert_distribution_history))
 for expert_index, shares in enumerate(history):
     ax.plot(range(1, EPOCHS + 1), shares, label=f"Expert {expert_index}")
 
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Share of tokens routed")
-ax.set_title("Expert load distribution over training")
-ax.legend(ncol=2, fontsize=8)
+ax.set_title("Complex MoE — Expert load distribution over training")
+ax.legend(ncol=4, fontsize=7)
 fig.tight_layout()
-fig.savefig("expert_distribution.png", dpi=150)
-print("Saved expert_distribution.png")
+fig.savefig("expert_distribution_complex.png", dpi=150)
+print("Saved expert_distribution_complex.png")
