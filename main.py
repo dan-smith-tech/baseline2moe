@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -7,7 +8,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 PATCH_SIZE = 14
 EMBED_DIM = 64
-EPOCHS = 100
+EPOCHS = 15
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -69,6 +70,8 @@ class MoE(nn.Module):
         super().__init__()
         self.experts = nn.ModuleList([Expert() for _ in range(NUM_EXPERTS)])
         self.gate = Gate()
+        # running tally of how many tokens each expert has processed
+        self.register_buffer("expert_counts", torch.zeros(NUM_EXPERTS))
 
     def forward(self, x):
         original_shape = x.shape
@@ -78,20 +81,21 @@ class MoE(nn.Module):
         flat_x = x.repeat_interleave(SELECT_TOP_K, dim=0)
         flat_topk_indices = topk_indices.view(-1)
 
+        with torch.no_grad():
+            counts = torch.bincount(flat_topk_indices, minlength=NUM_EXPERTS).float()
+            self.expert_counts += counts.to(self.expert_counts.device)
+
         final_output = torch.zeros(x.shape[0], EMBED_DIM, dtype=x.dtype).to(x.device)
 
         expert_outputs = []
         for i in range(len(self.experts)):
-            # positions inside flat_topk_indices where expert i is selected
             idx = torch.where(flat_topk_indices == i)[0]
             if idx.numel() > 0:
-                # inputs of every token assigned to expert i
                 expert_input = flat_x[idx]
                 expert_output = self.experts[i](expert_input)
                 expert_outputs.append((idx, expert_output))
 
         for expert_index, (idx, expert_output) in enumerate(expert_outputs):
-            # corresponding token indices in the original x
             token_indices = idx // SELECT_TOP_K
 
             weights = gate_weights[token_indices, expert_index].unsqueeze(-1)
@@ -103,6 +107,15 @@ class MoE(nn.Module):
             original_shape[0], original_shape[1], EMBED_DIM
         )
         return final_output, gate_weights
+
+    def get_expert_distribution(self):
+        total = self.expert_counts.sum()
+        if total == 0:
+            return torch.zeros_like(self.expert_counts)
+        return (self.expert_counts / total).cpu()
+
+    def reset_expert_counts(self):
+        self.expert_counts.zero_()
 
 
 class Model(nn.Module):
@@ -259,6 +272,8 @@ moe_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(moe_optimizer, T_max=
 
 print(f"Using device: {DEVICE}\n")
 
+expert_distribution_history = []
+
 for epoch in range(EPOCHS):
     print(f"Epoch {epoch + 1}/{EPOCHS}")
 
@@ -281,5 +296,26 @@ for epoch in range(EPOCHS):
     )
     moe_test_loss, moe_test_accuracy = test_moe(moe_model, test_loader, loss_fn)
     print(
-        f"MoE      -- Train Loss: {moe_train_loss:.4f}, Test Loss: {moe_test_loss:.4f}, Test Accuracy: {moe_test_accuracy:.4f}\n"
+        f"MoE      -- Train Loss: {moe_train_loss:.4f}, Test Loss: {moe_test_loss:.4f}, Test Accuracy: {moe_test_accuracy:.4f}"
     )
+
+    distribution = moe_model.ffn.get_expert_distribution()
+    expert_distribution_history.append(distribution.numpy())
+    distribution_str = " ".join(
+        f"E{i}: {p * 100:.1f}%" for i, p in enumerate(distribution)
+    )
+    print(f"Expert distribution -- {distribution_str}\n")
+    moe_model.ffn.reset_expert_counts()
+
+fig, ax = plt.subplots(figsize=(8, 5))
+history = list(zip(*expert_distribution_history))
+for expert_index, shares in enumerate(history):
+    ax.plot(range(1, EPOCHS + 1), shares, label=f"Expert {expert_index}")
+
+ax.set_xlabel("Epoch")
+ax.set_ylabel("Share of tokens routed")
+ax.set_title("Expert load distribution over training")
+ax.legend()
+fig.tight_layout()
+fig.savefig("expert_distribution.png", dpi=150)
+print("Saved expert_distribution.png")
