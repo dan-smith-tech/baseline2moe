@@ -5,7 +5,7 @@ class: invert
 paginate: true
 ---
 
-# Investigating Expert Collapse in EveNet Moe
+# Investigating Expert Collapse in EveNet MoE
 
 ---
 
@@ -41,18 +41,16 @@ paginate: true
 
 # Simple MoE Transformer
 
-- Same backbone - FFN replaced with a **4-expert Mixture-of-Experts** layer
-- Each expert: hidden dim 32 (total capacity matches baseline FFN)
+- Same backbone - FFN replaced with an 8-expert Mixture-of-Experts layer
 - Top-2 hard: linear gate scores tokens, dispatches to 2 highest-scoring experts
 - Tokens processed independently by their selected experts, recombined with softmax weights
-- Single load-balancing loss term (coefficient 0.05) to encourage even utilisation
+- Simple load balancing term to encourage equal distribution of tokens
 
 ---
 
 # EveNet MoE
 
-- 8 routed experts + 0 shared experts - twice the specialisation of simple MoE
-- Each expert: hidden dim 64, GELU activation (matches EveNet)
+- 8 routed experts + 0 shared experts - same count as simple MoE for a fair comparison
 - Top-2 routing with stochastic noise: extra learned noise head keeps exploration alive during training
 - Two balancing terms: auxiliary loss (α = 0.01) + logit-magnitude regularisation (c_z = 0.001)
 
@@ -77,22 +75,26 @@ Both MoE variants trained from scratch, independently of each other and the base
 
 | Metric            | Baseline | Simple MoE        | EveNet MoE            |
 | ----------------- | -------- | ----------------- | --------------------- |
-| **Test Accuracy** | 96.52 %  | 92.91 % (−3.6 pp) | **96.61 % (+0.1 pp)** |
-| Test Loss         | 0.124    | 0.247 (2×)        | 0.150 (1.2×)          |
-| Final Train Loss  | 0.347    | -                 | 0.024                 |
+| **Test Accuracy** | 96.50 %  | 92.88 % (−3.6 pp) | **96.61 % (+0.1 pp)** |
+| Test Loss         | 0.119    | 0.247 (2×)        | 0.150 (1.2×)          |
+| Final Train Loss  | 0.038    | 0.226             | 0.024                 |
 
-- Simple MoE underperforms badly - EveNet MoE **matches baseline accuracy** despite only activating 2 of 8 experts per token
+- Simple MoE underperforms - EveNet MoE matches baseline (wouldn't expect it to perform better in this case, but still interesting that specialisation doesn't hinder performance)
 
 ---
 
 # Expert Routing Distribution (Final Epoch) - Simple MoE
 
-| Expert | Share      | Deviation   |
-| ------ | ---------- | ----------- |
-| E0     | 20.6 %     | −4.4 pp     |
-| E1     | 23.8 %     | −1.2 pp     |
-| **E2** | **32.2 %** | **+7.2 pp** |
-| E3     | 23.8 %     | −1.2 pp     |
+| Expert | Share      | Deviation    |
+| ------ | ---------- | ------------ |
+| E0     | 16.2 %     | +3.7 pp      |
+| E1     | 8.6 %      | −3.9 pp      |
+| E2     | 12.0 %     | −0.5 pp      |
+| E3     | 7.7 %      | −4.8 pp      |
+| **E4** | 20.4 %     | **+7.9 pp**  |
+| E5     | 6.4 %      | −6.1 pp      |
+| **E6** | **23.6 %** | **+11.1 pp** |
+| E7     | 5.2 %      | −7.3 pp      |
 
 ---
 
@@ -110,7 +112,7 @@ Both MoE variants trained from scratch, independently of each other and the base
 
 ![Simple expert load distribution](expert_distribution_simple.png)
 
-- Expert 2 absorbs ~32 %
+- Expert 6 absorbs ~24 % - nearly double its fair share (12.5 %)
 
 ---
 
@@ -124,6 +126,51 @@ Both MoE variants trained from scratch, independently of each other and the base
 
 # Key Takeaways
 
-- **Simple MoE shows mild expert collapse:** E0 never recovers from a cold start (6.7 % → 20.6 %), E2 dominates
-- **EveNet MoE achieves near-uniform routing** within 4 epochs and maintains it - max deviation only −0.7 pp
-- The combination of **stochastic noise + dual balancing losses** is what makes the difference
+- Simple MoE shows severe expert collapse
+- EveNet MoE achieves near-uniform routing within 4 epochs and maintains it
+  - Shows that the standard routing-collapse fixes implemented do actually work
+
+---
+
+# Three Main Areas of Investigation
+
+These discoveries highlight 3 main areas for continued investigation:
+
+1. EveNet Training Regime
+2. EveNet Architecture
+3. HEP Data Itself
+
+---
+
+# Area 1: EveNet Training Regime
+
+- As this is a smaller, isolated testing model, it inherently is not a foundation model, where the concept of generalisaton across tasks does not exist and is not being replicated
+- Auxillary losses being overshadowed by task-specific losses
+  - Could be tested by ablating over MoE loss term values to look for any changes in expert utilisation distribution
+
+---
+
+# Area 2: EveNet Architecture
+
+- The existing issues with scaling the model up could potentially be impacting the expert specialisation
+  - So when the next version of the model is released, performance of MoE may be different (especially if we can test the bigger variants as well)
+- Stacking transformer blocks is may propagate early expert bias (unlikely the _cause_ though)
+
+---
+
+# Area 3: HEP Data Itself
+
+- The vision tokens used in this isolated simplified task are fundementally different to pointcloud HEP data
+- Need to better understand the distribution of the 500 million mote carlo data points that pretraining happens on
+  - Could it be that these are skewed towards in-distribution standard model, where specialisation is less useful than on the downstreams?
+- Does SIC lend itself towards a smooth representation in a way that discrete experts are harder to assign?
+
+---
+
+# Next Steps
+
+- **Best case: Ablation of hyperparameters to look for patterns**
+- Explore the previously mentioned 3 areas of investigation
+- Implement a framework for investigating what tokens (and more broadly 'type' of tokens) are being routed to each expert
+- Get the smaller EveNet model working (potentially the place to start ablating)
+- Explore expert voting as a fix in parallel to identifying the actual cause
