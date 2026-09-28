@@ -174,3 +174,22 @@ These discoveries highlight 3 main areas for continued investigation:
 - Implement a framework for investigating what tokens (and more broadly 'type' of tokens) are being routed to each expert
 - Get the smaller EveNet model working (potentially the place to start ablating)
 - Explore expert voting as a fix in parallel to identifying the actual cause
+
+---
+
+# Investigating Expert Specialisation
+
+---
+
+# Heatmaps
+
+![Simple expert specialisation heatmap](specialisation-k2.png)
+
+---
+
+# Observations
+
+- Mild 'specialisation': one or two cells per row noticeably brighter than the rest of that row
+- The bright cell's column being different, or at least not identical, across most rows, so experts are not all preferring the same class or position.
+- However, not a clear 'expert' for each digit
+- There is clearer specialisation seperation for each patch, which is logical, and shows that due to the feature extraction of this model it is being optimised to specialise in patches, not final outputs

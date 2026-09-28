@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -15,12 +16,14 @@ BATCH_SIZE = 64
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 DROPOUT = 0.0
+NUM_CLASSES = 10
+NUM_PATCHES = (28 // PATCH_SIZE) ** 2
 
 # these mirror the moe_* config block given for the big model, only scaled
 # down where needed so the standalone test trains quickly
 MOE_BASE_NUM_EXPERTS = 8
 MOE_EXPERT_SEGMENTATION_FACTOR = 1
-MOE_BASE_SELECT_TOP_K = 2
+MOE_BASE_SELECT_TOP_K = 4
 MOE_NUM_SHARED_EXPERTS = 0
 MOE_SCALE_EXPERT_DIM = True
 MOE_ALPHA = 0.01
@@ -113,6 +116,8 @@ class MoE(nn.Module):
         c_z: float,
         use_router_noise: bool,
         dropout: float,
+        num_classes: int = NUM_CLASSES,
+        num_patches: int = NUM_PATCHES,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -122,6 +127,8 @@ class MoE(nn.Module):
         self.num_shared_experts = num_shared_experts
         self.alpha = alpha
         self.c_z = c_z
+        self.num_classes = num_classes
+        self.num_patches = num_patches
 
         total_experts = self.base_num_experts * self.expert_segmentation_factor
         # num_experts is the total budget - routed experts fill the remainder after reserving shared slots
@@ -159,8 +166,24 @@ class MoE(nn.Module):
         # for the expert distribution feature and reset by the training loop
         self.register_buffer("expert_counts", torch.zeros(self.num_experts))
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        # per-epoch specialisation stats; non-persistent since these are
+        # purely diagnostic and reset every epoch by the training loop
+        self.register_buffer(
+            "expert_class_counts",
+            torch.zeros(self.num_experts, num_classes, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "expert_patch_counts",
+            torch.zeros(self.num_experts, num_patches, dtype=torch.long),
+            persistent=False,
+        )
+
+    def forward(
+        self, x: Tensor, targets: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor]:
         original_shape = x.shape
+        tokens_per_image = original_shape[1]
         # collapse batch/object axes to a 2D tensor so that each row corresponds to a single object to route to experts
         x = x.reshape(-1, x.shape[-1])
         num_objects = x.shape[0]
@@ -199,6 +222,35 @@ class MoE(nn.Module):
 
             with torch.no_grad():
                 self.expert_counts += objects_per_expert.to(self.expert_counts.device)
+
+                if targets is not None:
+                    # position within the image for every routed object; 0 is the CLS token
+                    patch_positions = object_indices.remainder(tokens_per_image)
+                    object_labels = targets.repeat_interleave(tokens_per_image)[
+                        object_indices
+                    ]
+
+                    # only image patches carry a meaningful position/class signal,
+                    # the CLS token is excluded from both specialisation views
+                    is_patch = patch_positions != 0
+                    patch_experts = expert_indices[is_patch]
+                    patch_labels = object_labels[is_patch]
+                    patch_slots = patch_positions[is_patch] - 1
+
+                    class_pair_ids = patch_experts * self.num_classes + patch_labels
+                    class_counts = torch.bincount(
+                        class_pair_ids,
+                        minlength=self.num_experts * self.num_classes,
+                    ).reshape(self.num_experts, self.num_classes)
+
+                    position_pair_ids = patch_experts * self.num_patches + patch_slots
+                    position_counts = torch.bincount(
+                        position_pair_ids,
+                        minlength=self.num_experts * self.num_patches,
+                    ).reshape(self.num_experts, self.num_patches)
+
+                    self.expert_class_counts += class_counts
+                    self.expert_patch_counts += position_counts
 
             cursor = 0
             # iterate through each expert's assigned objects in order of expert index
@@ -264,8 +316,20 @@ class MoE(nn.Module):
             return torch.zeros_like(self.expert_counts)
         return (self.expert_counts / total).cpu()
 
+    def get_class_routing(self):
+        counts = self.expert_class_counts.float()
+        return (counts / counts.sum(dim=1, keepdim=True).clamp_min(1)).cpu()
+
+    def get_patch_routing(self):
+        counts = self.expert_patch_counts.float()
+        return (counts / counts.sum(dim=1, keepdim=True).clamp_min(1)).cpu()
+
     def reset_expert_counts(self):
         self.expert_counts.zero_()
+
+    def reset_specialisation_counts(self):
+        self.expert_class_counts.zero_()
+        self.expert_patch_counts.zero_()
 
 
 class Model(nn.Module):
@@ -310,7 +374,7 @@ class Model(nn.Module):
 
         self.classifier = nn.Linear(EMBED_DIM, 10)
 
-    def forward(self, x):
+    def forward(self, x, targets=None):
         x = self.patch_embedding(x).flatten(2).transpose(1, 2)
 
         batch_size = x.size(0)
@@ -323,7 +387,7 @@ class Model(nn.Module):
         x = self.norm1(x + attn_output)
 
         if isinstance(self.ffn, MoE):
-            ffn_output, l_aux, cz_lz = self.ffn(x)
+            ffn_output, l_aux, cz_lz = self.ffn(x, targets=targets)
             x = self.norm2(x + ffn_output)
             logits = self.classifier(x[:, 0])
             return logits, l_aux, cz_lz
@@ -355,7 +419,7 @@ def train_moe(model, loader, optimizer, scheduler, loss_fn):
     for data, target in loader:
         data, target = data.to(DEVICE), target.to(DEVICE)
         optimizer.zero_grad()
-        output, l_aux, cz_lz = model(data)
+        output, l_aux, cz_lz = model(data, targets=target)
         loss = loss_fn(output, target) + l_aux + cz_lz
         loss.backward()
         optimizer.step()
@@ -389,7 +453,7 @@ def test_moe(model, loader, loss_fn):
     with torch.no_grad():
         for data, target in loader:
             data, target = data.to(DEVICE), target.to(DEVICE)
-            output, l_aux, cz_lz = model(data)
+            output, l_aux, cz_lz = model(data, targets=target)
             loss = loss_fn(output, target) + l_aux + cz_lz
             total_loss += loss.item()
             pred = output.argmax(dim=1, keepdim=True)
@@ -397,6 +461,30 @@ def test_moe(model, loader, loss_fn):
     avg_loss = total_loss / len(loader)
     accuracy = correct / len(loader.dataset)
     return avg_loss, accuracy
+
+
+def plot_epoch_heatmaps(class_routing, patch_routing, epoch, num_experts):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+
+    image = axes[0].imshow(class_routing, aspect="auto", vmin=0, vmax=0.3)
+    axes[0].set_title(f"Class mix per expert -- epoch {epoch}")
+    axes[0].set_xlabel("Digit class")
+    axes[0].set_ylabel("Expert")
+    axes[0].set_xticks(range(10))
+    axes[0].set_yticks(range(num_experts))
+    fig.colorbar(image, ax=axes[0], label="Fraction of routed patches")
+
+    image = axes[1].imshow(patch_routing, aspect="auto", vmin=0, vmax=0.5)
+    axes[1].set_title(f"Patch position mix per expert -- epoch {epoch}")
+    axes[1].set_xlabel("Patch position")
+    axes[1].set_ylabel("Expert")
+    axes[1].set_xticks(range(patch_routing.shape[1]))
+    axes[1].set_yticks(range(num_experts))
+    fig.colorbar(image, ax=axes[1], label="Fraction of routed patches")
+
+    fig.tight_layout()
+    fig.savefig(f"specialisation/epoch_{epoch:02d}.png", dpi=150)
+    plt.close(fig)
 
 
 loss_fn = nn.CrossEntropyLoss()
@@ -415,6 +503,12 @@ print(f"Using device: {DEVICE}\n")
 
 num_experts = moe_model.ffn.num_experts
 expert_distribution_history = []
+class_routing_history = []
+patch_routing_history = []
+
+import os
+
+os.makedirs("specialisation", exist_ok=True)
 
 for epoch in range(EPOCHS):
     print(f"Epoch {epoch + 1}/{EPOCHS}")
@@ -447,7 +541,17 @@ for epoch in range(EPOCHS):
         f"E{i}: {p * 100:.1f}%" for i, p in enumerate(distribution)
     )
     print(f"Expert distribution -- {distribution_str}\n")
+
+    # snapshot this epoch's specialisation, then wipe the counters so next
+    # epoch starts from zero and the sequence shows how routing changes
+    class_routing = moe_model.ffn.get_class_routing().numpy()
+    patch_routing = moe_model.ffn.get_patch_routing().numpy()
+    class_routing_history.append(class_routing)
+    patch_routing_history.append(patch_routing)
+    plot_epoch_heatmaps(class_routing, patch_routing, epoch + 1, num_experts)
+
     moe_model.ffn.reset_expert_counts()
+    moe_model.ffn.reset_specialisation_counts()
 
 fig, ax = plt.subplots(figsize=(8, 3))
 history = list(zip(*expert_distribution_history))
@@ -461,3 +565,11 @@ ax.legend(ncol=4, fontsize=7)
 fig.tight_layout()
 fig.savefig("expert_distribution_complex.png", dpi=150)
 print("Saved expert_distribution_complex.png")
+
+np.savez(
+    "specialisation_history.npz",
+    class_routing=np.stack(class_routing_history),
+    patch_routing=np.stack(patch_routing_history),
+    expert_distribution=np.stack(expert_distribution_history),
+)
+print("Saved specialisation_history.npz and per-epoch PNGs in specialisation/")
